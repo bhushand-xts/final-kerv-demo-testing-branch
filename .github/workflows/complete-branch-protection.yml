@@ -1,4 +1,4 @@
-name: Complete Branch Flow - Dev → Integration → QA → React App
+name: Complete Branch Flow - Dev to Integration to QA to React App
 
 on:
   push:
@@ -9,8 +9,8 @@ on:
       - "kerv_dev_bhushan"
       - "kerv_dev_nutan"
       - "feat/initial-react-app"
-
   pull_request:
+    types: [opened, synchronize, closed, labeled]
     branches:
       - "kerv_dev_pritesh"
       - "kerv_dev_tejas"
@@ -18,7 +18,6 @@ on:
       - "kerv_dev_bhushan"
       - "kerv_dev_nutan"
       - "feat/initial-react-app"
-
   workflow_dispatch:
 
 permissions:
@@ -27,23 +26,29 @@ permissions:
   issues: write
 
 env:
+  NODE_VERSION: "20"
   COVERAGE_THRESHOLD: 80
   SECURITY_SCORE_THRESHOLD: 80
 
 jobs:
-  # ================================================================
-  # JOB 0: SHARED CI (Lint + Test + Coverage + Security + Build)
-  # ================================================================
+
+  # ===========================================================================
+  # JOB 0 - SHARED CI
+  # Lint, Vitest coverage, Trivy security scan, Build
+  # Runs on push and PR open/synchronize. All downstream jobs use its outputs.
+  # ===========================================================================
   shared-ci:
-    name: Shared CI - Lint, Test, Coverage, Security, Build
+    name: "Shared CI - Lint, Test, Coverage, Security, Build"
     runs-on: ubuntu-latest
+    if: github.event.action != 'closed'
 
     outputs:
-      lint_status: ${{ steps.lint.outcome }}
-      test_status: ${{ steps.tests.outcome }}
-      build_status: ${{ steps.build.outcome }}
-      coverage_score: ${{ steps.coverage.outputs.coverage_percent }}
-      security_score: ${{ steps.security.outputs.score }}
+      lint_status:     ${{ steps.lint.outcome }}
+      test_status:     ${{ steps.tests.outcome }}
+      build_status:    ${{ steps.build.outcome }}
+      coverage_score:  ${{ steps.coverage.outputs.coverage_percent }}
+      security_score:  ${{ steps.security.outputs.score }}
+      security_detail: ${{ steps.security.outputs.detail }}
 
     steps:
       - name: Checkout code
@@ -51,19 +56,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install pnpm
-        run: npm install -g pnpm
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: pnpm
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Run linting
+      - name: Run ESLint
         id: lint
         continue-on-error: true
         run: pnpm lint
@@ -76,25 +83,72 @@ jobs:
       - name: Parse coverage score
         id: coverage
         run: |
-          if [ -f coverage/coverage-summary.json ]; then
-            COVERAGE=$(cat coverage/coverage-summary.json | jq '.total.lines.pct')
-            echo "coverage_percent=$COVERAGE" >> $GITHUB_OUTPUT
+          REPORT="coverage/coverage-summary.json"
+          if [ -f "$REPORT" ]; then
+            PCT=$(jq '.total.lines.pct' "$REPORT")
+            echo "coverage_percent=$PCT" >> $GITHUB_OUTPUT
+            echo "Line coverage: ${PCT}%"
           else
             echo "coverage_percent=0" >> $GITHUB_OUTPUT
+            echo "::warning::coverage-summary.json not found - check vite.config.js reporter includes json-summary"
           fi
 
-      - name: Run security scan (placeholder)
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y trivy
+
+      - name: Run Trivy security scan
+        id: trivy_scan
+        continue-on-error: true
+        run: |
+          trivy fs . \
+            --exit-code 0 \
+            --no-progress \
+            --severity HIGH,CRITICAL \
+            --format json \
+            --output trivy-results.json
+
+      - name: Parse security score
         id: security
         run: |
-          SECURITY_SCORE=85
-          echo "score=$SECURITY_SCORE" >> $GITHUB_OUTPUT
+          if [ -f trivy-results.json ]; then
+            CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json 2>/dev/null || echo 0)
+            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json 2>/dev/null || echo 0)
+          else
+            CRIT=0
+            HIGH=0
+          fi
+          SCORE=$(( 100 - (CRIT * 10) - (HIGH * 5) ))
+          SCORE=$(( SCORE < 0 ? 0 : SCORE ))
+          echo "score=$SCORE" >> $GITHUB_OUTPUT
+          echo "detail=critical=${CRIT}, high=${HIGH}" >> $GITHUB_OUTPUT
+          echo "Security score: ${SCORE}% (critical=${CRIT}, high=${HIGH})"
 
       - name: Build project
         id: build
         continue-on-error: true
         run: pnpm build
 
-      - name: Upload build artifacts (React branch only)
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.ref_name }}-run${{ github.run_number }}
+          path: coverage/
+          retention-days: 14
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-${{ github.ref_name }}-run${{ github.run_number }}
+          path: trivy-results.json
+          retention-days: 14
+
+      - name: Upload build artifact
         if: success() && github.ref_name == 'feat/initial-react-app'
         uses: actions/upload-artifact@v4
         with:
@@ -102,243 +156,181 @@ jobs:
           path: dist/
           retention-days: 5
 
-  # ================================================================
-  # JOB 1: QUALITY GATE (Dev Branch Push Only)
-  # ================================================================
+  # ===========================================================================
+  # JOB 1 - QUALITY GATE (dev branch pushes)
+  # Blocks with exit 1 if any metric is below threshold.
+  # ===========================================================================
   quality-gate-dev:
-    name: Quality Gate - Dev Branch Push
+    name: "Quality Gate - Dev Branch Push"
     runs-on: ubuntu-latest
     needs: shared-ci
-
     if: |
       github.event_name == 'push' &&
       contains(fromJson('["kerv_dev_pritesh","kerv_dev_tejas","kerv_dev_rahul","kerv_dev_bhushan"]'), github.ref_name)
 
     steps:
-      - name: Check quality thresholds
+      - name: Evaluate quality thresholds
         run: |
-          COVERAGE=${{ needs.shared-ci.outputs.coverage_score }}
-          SECURITY=${{ needs.shared-ci.outputs.security_score }}
+          COVERAGE="${{ needs.shared-ci.outputs.coverage_score }}"
+          SECURITY="${{ needs.shared-ci.outputs.security_score }}"
           LINT_OK="${{ needs.shared-ci.outputs.lint_status }}"
           TESTS_OK="${{ needs.shared-ci.outputs.test_status }}"
           BUILD_OK="${{ needs.shared-ci.outputs.build_status }}"
 
+          echo "========================================="
+          echo "         QUALITY GATE - DEV PUSH"
+          echo "========================================="
+          printf "  %-18s %s\n"   "Lint:"      "$LINT_OK"
+          printf "  %-18s %s\n"   "Tests:"     "$TESTS_OK"
+          printf "  %-18s %s\n"   "Build:"     "$BUILD_OK"
+          printf "  %-18s %s%%\n" "Coverage:"  "$COVERAGE"
+          printf "  %-18s %s%%\n" "Security:"  "$SECURITY"
+          echo "========================================="
+
           FAIL=false
+          [[ "$LINT_OK"  != "success" ]] && echo "::error::Lint failed"     && FAIL=true
+          [[ "$TESTS_OK" != "success" ]] && echo "::error::Tests failed"    && FAIL=true
+          [[ "$BUILD_OK" != "success" ]] && echo "::error::Build failed"    && FAIL=true
+          (( $(echo "$COVERAGE < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )) \
+            && echo "::error::Coverage ${COVERAGE}% below ${{ env.COVERAGE_THRESHOLD }}%" && FAIL=true
+          (( $(echo "$SECURITY < ${{ env.SECURITY_SCORE_THRESHOLD }}" | bc -l) )) \
+            && echo "::error::Security ${SECURITY}% below ${{ env.SECURITY_SCORE_THRESHOLD }}%" && FAIL=true
 
-          if [[ "$LINT_OK" != "success" ]]; then
-            echo "::error::❌ Lint failed"
-            FAIL=true
-          fi
+          [[ "$FAIL" == "true" ]] && echo "::error::QUALITY GATE FAILED - push blocked" && exit 1
+          echo "::notice::QUALITY GATE PASSED"
 
-          if [[ "$TESTS_OK" != "success" ]]; then
-            echo "::error::❌ Tests failed"
-            FAIL=true
-          fi
-
-          if [[ "$BUILD_OK" != "success" ]]; then
-            echo "::error::❌ Build failed"
-            FAIL=true
-          fi
-
-          if (( $(echo "$COVERAGE < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )); then
-            echo "::error::❌ Coverage too low: $COVERAGE% (Required: >= ${{ env.COVERAGE_THRESHOLD }}%)"
-            FAIL=true
-          fi
-
-          if (( $(echo "$SECURITY < ${{ env.SECURITY_SCORE_THRESHOLD }}" | bc -l) )); then
-            echo "::error::❌ Security too low: $SECURITY% (Required: >= ${{ env.SECURITY_SCORE_THRESHOLD }}%)"
-            FAIL=true
-          fi
-
-          if [[ "$FAIL" == "true" ]]; then
-            echo "::error::❌ QUALITY GATE FAILED"
-            exit 1
-          fi
-
-          echo "::notice::✅ QUALITY GATE PASSED"
-
-  # ================================================================
-  # JOB 2: QUALITY GATE FOR PR (Draft Enforcement + Remove Labels)
-  # ================================================================
+  # ===========================================================================
+  # JOB 2 - QUALITY GATE (PRs - draft enforcement)
+  # FAIL -> Draft + do-not-merge label + comment
+  # PASS -> Ready for review + remove labels + comment
+  # ===========================================================================
   quality-gate-pr:
-    name: Quality Gate - Pull Requests (Draft Enforcement)
+    name: "Quality Gate - Pull Request"
     runs-on: ubuntu-latest
     needs: shared-ci
-
-    if: github.event_name == 'pull_request'
+    if: |
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' || github.event.action == 'synchronize')
 
     steps:
-      - name: Evaluate PR Quality Gate
+      - name: Evaluate PR quality gate
         id: gate
+        continue-on-error: true
         run: |
-          COVERAGE=${{ needs.shared-ci.outputs.coverage_score }}
-          SECURITY=${{ needs.shared-ci.outputs.security_score }}
-          LINT_OK="${{ needs.shared-ci.outputs.lint_status }}"
-          TESTS_OK="${{ needs.shared-ci.outputs.test_status }}"
-          BUILD_OK="${{ needs.shared-ci.outputs.build_status }}"
-
+          COVERAGE="${{ needs.shared-ci.outputs.coverage_score }}"
+          SECURITY="${{ needs.shared-ci.outputs.security_score }}"
           FAIL=false
+          [[ "${{ needs.shared-ci.outputs.lint_status }}"  != "success" ]] && FAIL=true
+          [[ "${{ needs.shared-ci.outputs.test_status }}"  != "success" ]] && FAIL=true
+          [[ "${{ needs.shared-ci.outputs.build_status }}" != "success" ]] && FAIL=true
+          (( $(echo "$COVERAGE < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )) && FAIL=true
+          (( $(echo "$SECURITY < ${{ env.SECURITY_SCORE_THRESHOLD }}" | bc -l) )) && FAIL=true
+          [[ "$FAIL" == "true" ]] && exit 1
+          echo "::notice::PR quality gate passed"
 
-          if [[ "$LINT_OK" != "success" ]]; then
-            echo "::error::❌ Lint failed"
-            FAIL=true
-          fi
-
-          if [[ "$TESTS_OK" != "success" ]]; then
-            echo "::error::❌ Tests failed"
-            FAIL=true
-          fi
-
-          if [[ "$BUILD_OK" != "success" ]]; then
-            echo "::error::❌ Build failed"
-            FAIL=true
-          fi
-
-          if (( $(echo "$COVERAGE < ${{ env.COVERAGE_THRESHOLD }}" | bc -l) )); then
-            echo "::error::❌ Coverage too low: $COVERAGE% (Required: >= ${{ env.COVERAGE_THRESHOLD }}%)"
-            FAIL=true
-          fi
-
-          if (( $(echo "$SECURITY < ${{ env.SECURITY_SCORE_THRESHOLD }}" | bc -l) )); then
-            echo "::error::❌ Security too low: $SECURITY% (Required: >= ${{ env.SECURITY_SCORE_THRESHOLD }}%)"
-            FAIL=true
-          fi
-
-          if [[ "$FAIL" == "true" ]]; then
-            exit 1
-          fi
-
-          echo "::notice::✅ PR QUALITY GATE PASSED"
-
-      # ------------------------------------------------------------
-      # FAILED → Comment + Label + Convert to Draft
-      # ------------------------------------------------------------
-      - name: Mark PR as Draft + Add Labels + Comment (FAILED)
-        if: failure()
-        uses: actions/github-script@v6
+      - name: PR FAILED - draft and label
+        if: steps.gate.outcome == 'failure'
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const prNumber = context.issue.number;
+            const pr = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const body = "## Quality Gate FAILED\n\n"
+              + "This PR has been converted to **Draft** to prevent accidental merging.\n\n"
+              + "| Check | Result |\n"
+              + "|---|---|\n"
+              + "| Lint | " + "${{ needs.shared-ci.outputs.lint_status }}" + " |\n"
+              + "| Tests | " + "${{ needs.shared-ci.outputs.test_status }}" + " |\n"
+              + "| Build | " + "${{ needs.shared-ci.outputs.build_status }}" + " |\n"
+              + "| Coverage | " + "${{ needs.shared-ci.outputs.coverage_score }}" + "% (need >= ${{ env.COVERAGE_THRESHOLD }}%) |\n"
+              + "| Security | " + "${{ needs.shared-ci.outputs.security_score }}" + "% (need >= ${{ env.SECURITY_SCORE_THRESHOLD }}%) |\n"
+              + "| Security detail | " + "${{ needs.shared-ci.outputs.security_detail }}" + " |\n\n"
+              + "Fix the issues above and push again.";
+            await github.rest.issues.createComment({ owner, repo, issue_number: pr, body });
+            await github.rest.issues.addLabels({ owner, repo, issue_number: pr, labels: ["do-not-merge", "quality-gate-failed"] });
+            await github.rest.pulls.update({ owner, repo, pull_number: pr, draft: true });
 
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              body: `
-            ❌ **QUALITY GATE FAILED**
-            
-            This PR has been marked as **DRAFT** to prevent merging.
-
-            **Results**
-            - Lint: ${{ needs.shared-ci.outputs.lint_status }}
-            - Tests: ${{ needs.shared-ci.outputs.test_status }}
-            - Build: ${{ needs.shared-ci.outputs.build_status }}
-            - Coverage: ${{ needs.shared-ci.outputs.coverage_score }}% (Required: >= ${{ env.COVERAGE_THRESHOLD }}%)
-            - Security: ${{ needs.shared-ci.outputs.security_score }}% (Required: >= ${{ env.SECURITY_SCORE_THRESHOLD }}%)
-
-            Fix issues and push again.
-            `
-            });
-
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              labels: ["do-not-merge", "quality-gate-failed"]
-            });
-
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              draft: true
-            });
-
-      # ------------------------------------------------------------
-      # PASSED → Ready for Review + Remove Labels + Comment
-      # ------------------------------------------------------------
-      - name: Mark PR Ready + Remove Labels + Comment (PASSED)
-        if: success()
-        uses: actions/github-script@v6
+      - name: PR PASSED - mark ready
+        if: steps.gate.outcome == 'success'
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const prNumber = context.issue.number;
-            const labelsToRemove = ["do-not-merge", "quality-gate-failed"];
-
-            for (const label of labelsToRemove) {
-              try {
-                await github.rest.issues.removeLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNumber,
-                  name: label
-                });
-              } catch (e) {
-                console.log(`Label ${label} not found, skipping`);
-              }
+            const pr = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            for (const label of ["do-not-merge", "quality-gate-failed"]) {
+              try { await github.rest.issues.removeLabel({ owner, repo, issue_number: pr, name: label }); } catch (_) {}
             }
+            await github.rest.pulls.update({ owner, repo, pull_number: pr, draft: false });
+            const body = "## Quality Gate PASSED\n\n"
+              + "PR is now **Ready for review**.\n\n"
+              + "| Check | Result |\n"
+              + "|---|---|\n"
+              + "| Lint | " + "${{ needs.shared-ci.outputs.lint_status }}" + " |\n"
+              + "| Tests | " + "${{ needs.shared-ci.outputs.test_status }}" + " |\n"
+              + "| Build | " + "${{ needs.shared-ci.outputs.build_status }}" + " |\n"
+              + "| Coverage | " + "${{ needs.shared-ci.outputs.coverage_score }}" + "% |\n"
+              + "| Security | " + "${{ needs.shared-ci.outputs.security_score }}" + "% |\n"
+              + "| Security detail | " + "${{ needs.shared-ci.outputs.security_detail }}" + " |";
+            await github.rest.issues.createComment({ owner, repo, issue_number: pr, body });
 
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              draft: false
-            });
-
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              body: `
-            ✅ **QUALITY GATE PASSED**
-            
-            PR has been converted to **Ready for review**.
-
-            - Coverage: ${{ needs.shared-ci.outputs.coverage_score }}%
-            - Security: ${{ needs.shared-ci.outputs.security_score }}%
-            `
-            });
-
-  # ================================================================
-  # JOB 3: AUTO PR → Integration Branch (Dev -> kerv_dev_bhushan)
-  # ================================================================
+  # ===========================================================================
+  # JOB 3 - AUTO PR: dev branch -> kerv_dev_bhushan (integration)
+  # Only runs after quality gate passes. Skips if PR already exists.
+  # ===========================================================================
   auto-forward-to-integration:
-    name: Auto-Forward to Integration (Dev -> Integration)
+    name: "Auto PR to Integration"
     runs-on: ubuntu-latest
     needs: quality-gate-dev
-
     if: |
       github.event_name == 'push' &&
       contains(fromJson('["kerv_dev_pritesh","kerv_dev_tejas","kerv_dev_rahul"]'), github.ref_name)
 
     steps:
-      - name: Create PR to Integration (kerv_dev_bhushan)
-        uses: actions/github-script@v6
+      - name: Create PR to integration branch
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const sourceBranch = context.ref.replace("refs/heads/", "");
-
-            const { data: pr } = await github.rest.pulls.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `🔄 Auto PR: ${sourceBranch} → kerv_dev_bhushan`,
-              body: `✅ Quality Gate Passed.\n\nAuto-generated PR for integration testing.`,
-              head: sourceBranch,
+            const source = context.ref.replace("refs/heads/", "");
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const existing = await github.rest.pulls.list({
+              owner, repo,
+              head: owner + ":" + source,
+              base: "kerv_dev_bhushan",
+              state: "open"
+            });
+            if (existing.data.length > 0) {
+              console.log("PR already open: " + existing.data[0].html_url);
+              return;
+            }
+            const body = "## Automated Integration PR\n\n"
+              + "Quality Gate passed.\n\n"
+              + "| Field | Value |\n"
+              + "|---|---|\n"
+              + "| Source | " + source + " |\n"
+              + "| Actor | ${{ github.actor }} |\n"
+              + "| Commit | ${{ github.sha }} |";
+            const result = await github.rest.pulls.create({
+              owner, repo,
+              title: "Auto PR: " + source + " to kerv_dev_bhushan",
+              body,
+              head: source,
               base: "kerv_dev_bhushan"
             });
+            console.log("PR created: " + result.data.html_url);
 
-            console.log("PR created:", pr.html_url);
-
-  # ================================================================
-  # JOB 4: Forward to QA after Integration merge
-  # ================================================================
+  # ===========================================================================
+  # JOB 4 - FORWARD TO QA after integration merge
+  # Triggers when a PR into kerv_dev_bhushan is closed and merged.
+  # ===========================================================================
   forward-to-qa:
-    name: Forward to QA (Integration -> QA)
+    name: "Forward to QA"
     runs-on: ubuntu-latest
-
     if: |
       github.event_name == 'pull_request' &&
       github.base_ref == 'kerv_dev_bhushan' &&
@@ -346,44 +338,62 @@ jobs:
       github.event.pull_request.merged == true
 
     steps:
-      - name: Create PR to QA (kerv_dev_nutan)
-        uses: actions/github-script@v6
+      - name: Create PR to QA branch
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const { data: pr } = await github.rest.pulls.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `🧪 QA Testing - From kerv_dev_bhushan`,
-              body: `QA Testing Required.\n\nWhen approved, add label: **qa-approved**.`,
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const existing = await github.rest.pulls.list({
+              owner, repo,
+              head: owner + ":kerv_dev_bhushan",
+              base: "kerv_dev_nutan",
+              state: "open"
+            });
+            if (existing.data.length > 0) {
+              console.log("QA PR already open: " + existing.data[0].html_url);
+              return;
+            }
+            const body = "## QA Testing Required\n\n"
+              + "Integration build is ready for manual testing.\n\n"
+              + "When done, add the label **qa-approved** to this PR.\n"
+              + "The workflow will automatically promote to production.\n\n"
+              + "| Field | Value |\n"
+              + "|---|---|\n"
+              + "| Source | kerv_dev_bhushan |\n"
+              + "| Merged PR | #${{ github.event.pull_request.number }} |";
+            const result = await github.rest.pulls.create({
+              owner, repo,
+              title: "QA Testing - from kerv_dev_bhushan",
+              body,
               head: "kerv_dev_bhushan",
               base: "kerv_dev_nutan"
             });
-
             await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
+              owner, repo,
+              issue_number: result.data.number,
               labels: ["qa-testing", "awaiting-qa-approval"]
             });
+            console.log("QA PR created: " + result.data.html_url);
 
-            console.log("QA PR created:", pr.html_url);
-
-  # ================================================================
-  # JOB 5: QA Approval Gate → Creates PR to React App
-  # ================================================================
+  # ===========================================================================
+  # JOB 5 - QA APPROVAL GATE
+  # Triggers when "qa-approved" label is added to a PR into kerv_dev_nutan.
+  # Merges the QA PR then opens a deploy PR to feat/initial-react-app.
+  # ===========================================================================
   qa-approval-gate:
-    name: QA Approval Gate (qa-approved required)
+    name: "QA Approval Gate"
     runs-on: ubuntu-latest
-
     if: |
       github.event_name == 'pull_request' &&
       github.base_ref == 'kerv_dev_nutan' &&
-      contains(github.event.pull_request.labels.*.name, 'qa-approved')
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'qa-approved'
 
     steps:
-      - name: Merge QA PR
-        uses: actions/github-script@v6
+      - name: Merge QA PR into kerv_dev_nutan
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -391,49 +401,67 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number,
-              merge_method: "squash"
+              merge_method: "squash",
+              commit_title: "chore: qa-approved merge into kerv_dev_nutan"
             });
+            console.log("Merged QA PR #" + context.issue.number);
 
-            console.log("Merged into QA branch.");
-
-      - name: Create PR to React App branch
-        uses: actions/github-script@v6
+      - name: Create deploy PR to feat/initial-react-app
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const { data: pr } = await github.rest.pulls.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: "🚀 Deploy to React App - QA Approved",
-              body: "✅ QA Approved.\n\nAuto deployment PR created.",
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const existing = await github.rest.pulls.list({
+              owner, repo,
+              head: owner + ":kerv_dev_nutan",
+              base: "feat/initial-react-app",
+              state: "open"
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.addLabels({
+                owner, repo,
+                issue_number: existing.data[0].number,
+                labels: ["auto-deployment"]
+              });
+              console.log("Labelled existing deploy PR: " + existing.data[0].html_url);
+              return;
+            }
+            const body = "## Production Deployment\n\n"
+              + "QA approved. This PR will be merged automatically.\n"
+              + "S3 and CloudFront deploy runs after merge.";
+            const result = await github.rest.pulls.create({
+              owner, repo,
+              title: "Deploy to React App - QA Approved",
+              body,
               head: "kerv_dev_nutan",
               base: "feat/initial-react-app"
             });
-
             await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
+              owner, repo,
+              issue_number: result.data.number,
               labels: ["auto-deployment"]
             });
+            console.log("Deploy PR created: " + result.data.html_url);
 
-            console.log("Deployment PR created:", pr.html_url);
-
-  # ================================================================
-  # JOB 6: Merge Deployment PR into React App branch
-  # ================================================================
+  # ===========================================================================
+  # JOB 6 - REACT APP MERGE
+  # Triggers when "auto-deployment" label is added to a PR into
+  # feat/initial-react-app. Merges it, which fires Job 7 via push event.
+  # ===========================================================================
   react-app-merge:
-    name: React App Merge & Deploy
+    name: "React App Auto Merge"
     runs-on: ubuntu-latest
-
     if: |
       github.event_name == 'pull_request' &&
       github.base_ref == 'feat/initial-react-app' &&
-      contains(github.event.pull_request.labels.*.name, 'auto-deployment')
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'auto-deployment'
 
     steps:
       - name: Merge into feat/initial-react-app
-        uses: actions/github-script@v6
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -441,21 +469,99 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number,
-              merge_method: "squash"
+              merge_method: "squash",
+              commit_title: "chore: auto-deployment - QA approved merge to production"
             });
+            console.log("Merged into feat/initial-react-app");
 
-            console.log("Merged into React App branch.");
-
-  # ================================================================
-  # JOB 7: Final React Build Status (Push to react branch)
-  # ================================================================
+  # ===========================================================================
+  # JOB 7 - FINAL BUILD AND DEPLOY
+  # Triggers on push to feat/initial-react-app (after Job 6 merges).
+  # Builds, deploys to S3, invalidates CloudFront.
+  # ===========================================================================
   react-app-final-ci:
-    name: React App Final Build (Push)
+    name: "React App Final Build and Deploy"
     runs-on: ubuntu-latest
     needs: shared-ci
-
     if: github.ref_name == 'feat/initial-react-app' && github.event_name == 'push'
 
     steps:
-      - name: React build success
-        run: echo "✅ React App Build Successful"
+      - name: Checkout production branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/initial-react-app
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Production build
+        run: pnpm build
+        env:
+          NODE_ENV: production
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Deploy to S3
+        run: |
+          echo "Deploying to s3://xts-assets/production/"
+
+          aws s3 cp dist/index.html \
+            s3://xts-assets/production/index.html \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --content-type "text/html"
+
+          aws s3 sync dist/ \
+            s3://xts-assets/production/ \
+            --delete \
+            --exclude "index.html" \
+            --cache-control "public, max-age=31536000, immutable"
+
+          echo "S3 sync complete"
+
+      - name: Invalidate CloudFront cache
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.AWS_CLOUDFRONT_DIST_ID }} \
+            --paths "/production/*" \
+            --query "Invalidation.Id" \
+            --output text)
+          echo "Invalidation ID: $INVALIDATION_ID"
+          aws cloudfront wait invalidation-completed \
+            --distribution-id ${{ secrets.AWS_CLOUDFRONT_DIST_ID }} \
+            --id "$INVALIDATION_ID"
+          echo "CloudFront cache cleared - production is live"
+
+      - name: Upload build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-build-${{ github.run_number }}
+          path: dist/
+          retention-days: 14
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "================================================="
+          echo "  Branch : feat/initial-react-app"
+          echo "  Build  : #${{ github.run_number }}"
+          echo "  Commit : ${{ github.sha }}"
+          echo "  Actor  : ${{ github.actor }}"
+          echo "  Bucket : s3://xts-assets/production/"
+          echo "================================================="
